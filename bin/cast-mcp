@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# cast-mcp — launcher for the read-only MCP stdio server over cast.db.
+set -euo pipefail
+
+# CAST subprocess guard: stay silent + exit 0 for framework subprocess calls.
+[[ "${CLAUDE_SUBPROCESS:-}" == "1" ]] && exit 0
+
+# Resolve this script's real directory, following symlinks (Homebrew symlinks bin/).
+_source="${BASH_SOURCE[0]}"
+while [ -L "$_source" ]; do
+  _dir="$(cd -P "$(dirname "$_source")" && pwd)"
+  _source="$(readlink "$_source")"
+  [[ "$_source" != /* ]] && _source="$_dir/$_source"
+done
+SELF_DIR="$(cd -P "$(dirname "$_source")" && pwd)"
+
+# Locate the server script: env override, repo layout, installed layout, default.
+_resolve_server() {
+  local candidates=(
+    "${CAST_MCP_SERVER:-}"
+    "$SELF_DIR/../scripts/cast-mcp-server.py"
+    "$SELF_DIR/../lib/cast-mcp/cast-mcp-server.py"
+    "$HOME/.local/lib/cast-mcp/cast-mcp-server.py"
+  )
+  local c
+  for c in "${candidates[@]}"; do
+    [[ -n "$c" && -f "$c" ]] && { printf '%s\n' "$c"; return 0; }
+  done
+  return 1
+}
+
+_resolve_version() {
+  local c
+  for c in "$SELF_DIR/../VERSION" "$SELF_DIR/../lib/cast-mcp/VERSION" "$HOME/.local/lib/cast-mcp/VERSION"; do
+    [[ -f "$c" ]] && { cat "$c"; return 0; }
+  done
+  printf 'unknown\n'
+}
+
+_die() { printf 'cast-mcp: %s\n' "$*" >&2; exit 1; }
+
+SERVER="$(_resolve_server || true)"
+sub="${1:-help}"
+
+case "$sub" in
+  serve)
+    shift
+    [[ -n "$SERVER" ]] || _die "cast-mcp-server.py not found. Run: bash install.sh (or set CAST_MCP_SERVER)"
+    exec python3 "$SERVER" "$@"
+    ;;
+  config)
+    cat <<'EOF'
+Add CAST's read-only record server to a project .mcp.json:
+
+  {
+    "mcpServers": {
+      "cast-record": {
+        "type": "stdio",
+        "command": "cast-mcp",
+        "args": ["serve"]
+      }
+    }
+  }
+
+Or register via the Claude Code CLI:
+
+  claude mcp add cast-record -- cast-mcp serve
+
+Read-only (cast.db mode=ro) and local-only (stdio, no network). 5 tools + 5 resources.
+EOF
+    ;;
+  status)
+    db="${CAST_DB_PATH:-$HOME/.claude/cast.db}"
+    [[ -f "$db" ]] || _die "cast.db not found at $db"
+    [[ -n "$SERVER" ]] || _die "cast-mcp-server.py not found"
+    printf 'cast-mcp: server %s\n' "$SERVER"
+    printf 'cast-mcp: cast.db %s\n' "$db"
+    out="$(printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' | python3 "$SERVER" 2>/dev/null | head -1 || true)"
+    if printf '%s' "$out" | grep -q '"protocolVersion"'; then
+      pv="$(printf '%s' "$out" | sed -n 's/.*"protocolVersion"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+      printf 'cast-mcp: handshake OK (protocol %s)\n' "${pv:-unknown}"
+    else
+      _die "handshake FAILED"
+    fi
+    ;;
+  version|--version|-v)
+    printf 'cast-mcp v%s\n' "$(_resolve_version)"
+    ;;
+  help|--help|-h)
+    cat <<'EOF'
+Usage: cast-mcp <serve|config|status|version>
+  serve     Run the read-only MCP stdio server (invoked by MCP clients via .mcp.json)
+  config    Print the .mcp.json entry / `claude mcp add` line to opt in
+  status    Check cast.db is present and the server handshake succeeds
+  version   Print version
+EOF
+    ;;
+  *)
+    _die "Unknown subcommand: $sub (try: cast-mcp help)"
+    ;;
+esac
